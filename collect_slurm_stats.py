@@ -1,192 +1,222 @@
 #!/usr/bin/env python3
+"""
+collect_slurm_stats_fixed.py — records live Slurm usage to a CSV with a *stable* GPU
+schema so downstream analysis is painless.  The GPU columns are always written in a
+fixed order, regardless of which cards are in use when the script runs.
+
+Changes compared with the original version
+------------------------------------------
+* Added GPU_CATEGORIES / GPU_TYPES_ORDERED constants that enumerate every GPU type
+  we care about.  The column layout never fluctuates.
+* Removed the dynamic discovery of GPU types; the header is now deterministic.
+* Normalised GPU type keys to lowercase to match our constant list.
+* Defensive coding touches (stripping whitespace, defaulting to 0, etc.).
+
+Drop‑in replacement — invoke from cron or a systemd timer exactly as before.
+"""
 
 import subprocess
-import re
 import csv
 from datetime import datetime
 import os
 from collections import defaultdict
 import logging
+import re
 
-# --- Configuration ---
-OUTPUT_DIR = os.path.expanduser("~/slurm_monitor") # Store data in user's home
+# --- GPU configuration (static schema) ---------------------------------------
+GPU_CATEGORIES = {
+    "gpu-low": [
+        "titanx",
+        "titanxp",
+        "1080ti",
+        "2080ti",
+        "t4",
+    ],
+    "gpu-mid": [
+        "titanrtx",
+        "r6000",
+        "l4",
+        "3090",
+        "a5000",
+        "a5500",
+        "v100",
+    ],
+    "gpu-high": [
+        "a40",
+        "a6000",
+        "6000ada",
+        "a100",
+        "h100",
+    ],
+}
+
+# Deterministic flat list for CSV columns
+GPU_TYPES_ORDERED = [gpu for tier in ("gpu-low", "gpu-mid", "gpu-high") for gpu in GPU_CATEGORIES[tier]]
+
+# --- Configuration -----------------------------------------------------------
+OUTPUT_DIR = os.path.expanduser("~/slurm_monitor")  # Store data in user's home
 DATA_FILE = os.path.join(OUTPUT_DIR, "slurm_resource_usage.csv")
 LOG_FILE = os.path.join(OUTPUT_DIR, "slurm_collector.log")
-SACCT_CMD_FORMAT = "/usr/local/slurm/current/bin/sacct -a -X --format=User,AllocTRES,State --parsable2 --noheader --state=RUNNING"
+SACCT_CMD = (
+    "/usr/local/slurm/current/bin/sacct -a -X --format=User,AllocTRES,State "
+    "--parsable2 --noheader --state=RUNNING"
+)
 
-# --- Logging Setup ---
+# --- Logging Setup -----------------------------------------------------------
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-logging.basicConfig(filename=LOG_FILE,
-                    level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 
-def parse_mem_to_gb(mem_str):
-    """Converts memory string (e.g., 500G, 32000M, 102400K) to GB."""
+# -----------------------------------------------------------------------------
+# Helper functions
+# -----------------------------------------------------------------------------
+
+def parse_mem_to_gb(mem_str: str) -> float:
+    """Convert Slurm memory strings (e.g. "500G", "32000M") into GB as float."""
     if not mem_str:
         return 0.0
-    val_str = mem_str[:-1]
-    unit = mem_str[-1:].upper()
-    try:
-        val = float(val_str)
-        if unit == 'G':
-            return val
-        elif unit == 'M':
-            return val / 1024.0
-        elif unit == 'K':
-            return val / (1024.0 * 1024.0)
-        else: # Assuming bytes if no unit or unknown unit
-            return float(mem_str) / (1024.0 * 1024.0 * 1024.0)
-    except ValueError:
-        logging.error(f"Could not parse memory value from: {mem_str}")
+    match = re.fullmatch(r"([0-9.]+)([KMG]?)", mem_str.strip(), re.I)
+    if not match:
+        logging.error("Unrecognised mem format: %s", mem_str)
         return 0.0
+    value, unit = match.groups()
+    value = float(value)
+    unit = unit.upper()
+    if unit == "G":
+        return value
+    if unit == "M":
+        return value / 1024.0
+    if unit == "K":
+        return value / (1024.0 * 1024.0)
+    # Bytes (no unit)
+    return value / (1024.0 ** 3)
 
-def parse_alloc_tres(tres_string):
-    """
-    Parses the AllocTRES string.
-    Example: billing=16,cpu=16,gres/gpu:a6000=4,gres/gpu=4,mem=500G,node=1
-    Returns a dictionary: {'cpu': X, 'mem_gb': Y, 'gpus': {'type1': Z1, 'type2': Z2}, 'total_gpus': T}
-    """
-    resources = {'cpu': 0, 'mem_gb': 0.0, 'gpus': defaultdict(int), 'total_gpus': 0}
-    if not tres_string or tres_string.lower() == 'none':
+
+def parse_alloc_tres(tres_string: str):
+    print(tres_string)
+    """Parse the AllocTRES field and return a structured dict."""
+    resources = {
+        "cpu": 0,
+        "mem_gb": 0.0,
+        "gpus": defaultdict(int),
+        "total_gpus": 0,
+    }
+
+    if not tres_string or tres_string.lower() == "none":
         return resources
 
-    parts = tres_string.split(',')
-    for part in parts:
-        if not part:
+    for part in tres_string.split(","):
+        if "=" not in part:
             continue
-        try:
-            key, value = part.split('=', 1)
-            key = key.strip()
-            value = value.strip()
+        key, value = (s.strip() for s in part.split("=", 1))
+        if key == "cpu":
+            resources["cpu"] += int(value)
+        elif key == "mem":
+            resources["mem_gb"] += parse_mem_to_gb(value)
+        elif key.startswith("gres/gpu:"):
+            gpu_type = key.split(":", 1)[1].lower()
+            gpu_count = int(value)
+            resources["gpus"][gpu_type] += gpu_count
+            resources["total_gpus"] += gpu_count
 
-            if key == 'cpu':
-                resources['cpu'] += int(value)
-            elif key == 'mem':
-                resources['mem_gb'] += parse_mem_to_gb(value)
-            elif key.startswith('gres/gpu:'):
-                gpu_type = key.split(':')[1]
-                gpu_count = int(value)
-                resources['gpus'][gpu_type] += gpu_count
-                resources['total_gpus'] += gpu_count
-            elif key == 'gres/gpu': # This is a fallback if only total GPUs are listed
-                                    # and not already counted by specific types
-                if not resources['gpus']: # Only use if no specific types found
-                     resources['total_gpus'] += int(value)
-                     resources['gpus']['unknown'] += int(value)
-
-
-        except ValueError as e:
-            logging.warning(f"Could not parse TRES part '{part}': {e}")
-        except Exception as e:
-            logging.error(f"Unexpected error parsing TRES part '{part}': {e}")
     return resources
 
+
+# -----------------------------------------------------------------------------
+# Core collection logic
+# -----------------------------------------------------------------------------
+
 def get_slurm_usage():
-    """
-    Runs sacct and aggregates resource usage by user.
-    Returns a dictionary:
-    {
-        'user1': {'cpu': X, 'mem_gb': Y, 'gpus': {'typeA': N, 'typeB': M}, 'total_gpus': P, 'job_count': J},
-        ...
-    }
-    """
-    user_usage = defaultdict(lambda: {
-        'cpu': 0,
-        'mem_gb': 0.0,
-        'gpus': defaultdict(int),
-        'total_gpus': 0,
-        'job_count': 0
-    })
+    """Query sacct and aggregate usage per user."""
+    usage = defaultdict(
+        lambda: {
+            "cpu": 0,
+            "mem_gb": 0.0,
+            "gpus": defaultdict(int),
+            "total_gpus": 0,
+            "job_count": 0,
+        }
+    )
 
     try:
-        process = subprocess.Popen(SACCT_CMD_FORMAT, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        stdout, stderr = process.communicate()
-
-        if process.returncode != 0:
-            logging.error(f"sacct command failed with error: {stderr}")
+        proc = subprocess.Popen(
+            SACCT_CMD, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        stdout, stderr = proc.communicate()
+        if proc.returncode != 0:
+            logging.error("sacct failed: %s", stderr.strip())
             return {}
-        if not stdout:
-            logging.info("sacct command returned no output.")
-            return {}
-
-        lines = stdout.strip().split('\n')
-        if not lines or (len(lines) == 1 and not lines[0].strip()): # Handle empty output after strip
-            logging.info("No running jobs found.")
-            return {}
-
-        for line in lines:
+        for line in stdout.splitlines():
             if not line.strip():
                 continue
-            fields = line.split('|')
-            if len(fields) < 3: # Expecting User, AllocTRES, State
-                logging.warning(f"Skipping malformed line: {line}")
+            try:
+                user, tres, state = line.split("|", 2)
+            except ValueError:
+                logging.warning("Malformed line from sacct: %s", line)
                 continue
-
-            user, tres_string, state = fields[0], fields[1], fields[2]
-
-            # We already filter by state=RUNNING in sacct, but double check
             if state.strip().upper() != "RUNNING":
-                continue
+                continue  # --state=RUNNING should guarantee this, but be safe
 
-            parsed_tres = parse_alloc_tres(tres_string)
-
-            user_usage[user]['cpu'] += parsed_tres['cpu']
-            user_usage[user]['mem_gb'] += parsed_tres['mem_gb']
-            for gpu_type, count in parsed_tres['gpus'].items():
-                user_usage[user]['gpus'][gpu_type] += count
-            user_usage[user]['total_gpus'] += parsed_tres['total_gpus']
-            user_usage[user]['job_count'] += 1
-
+            tres_parsed = parse_alloc_tres(tres)
+            rec = usage[user]
+            rec["cpu"] += tres_parsed["cpu"]
+            rec["mem_gb"] += tres_parsed["mem_gb"]
+            rec["total_gpus"] += tres_parsed["total_gpus"]
+            rec["job_count"] += 1
+            for gtype, cnt in tres_parsed["gpus"].items():
+                rec["gpus"][gtype] += cnt
     except FileNotFoundError:
-        logging.error("sacct command not found. Ensure Slurm tools are in PATH.")
-        return {}
-    except Exception as e:
-        logging.error(f"An error occurred while running/parsing sacct: {e}")
-        return {}
+        logging.error("sacct not found; ensure Slurm CLI tools are installed and in PATH")
+    except Exception as exc:
+        logging.exception("Unexpected error while collecting Slurm usage: %s", exc)
 
-    return user_usage
+    return usage
+
+
+# -----------------------------------------------------------------------------
+# Main entry point
+# -----------------------------------------------------------------------------
 
 def main():
-    logging.info("Starting data collection.")
-    current_usage = get_slurm_usage()
-    timestamp = datetime.now().isoformat()
-
-    if not current_usage:
-        logging.info("No usage data collected.")
+    logging.info("collect_slurm_stats_fixed starting an iteration")
+    usage = get_slurm_usage()
+    if not usage:
+        logging.info("No running jobs; nothing to log this cycle")
         return
 
-    all_gpu_types = set()
-    for data in current_usage.values():
-        all_gpu_types.update(data['gpus'].keys())
-    sorted_gpu_types = sorted(list(all_gpu_types))
+    timestamp = datetime.now().isoformat()
+    fieldnames = (
+        ["timestamp", "user", "job_count", "cpus", "mem_gb", "total_gpus"]
+        + [f"gpu_{gpu}" for gpu in GPU_TYPES_ORDERED]
+    )
 
-    fieldnames = ['timestamp', 'user', 'job_count', 'cpus', 'mem_gb', 'total_gpus'] + \
-                 [f'gpu_{gtype}' for gtype in sorted_gpu_types]
-
-    file_exists = os.path.isfile(DATA_FILE)
+    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
     try:
-        with open(DATA_FILE, 'a', newline='') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
-            if not file_exists or os.path.getsize(DATA_FILE) == 0:
+        with open(DATA_FILE, "a", newline="") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction="ignore")
+            if csvfile.tell() == 0:
                 writer.writeheader()
 
-            for user, data in current_usage.items():
+            for user, data in usage.items():
                 row = {
-                    'timestamp': timestamp,
-                    'user': user,
-                    'job_count': data['job_count'],
-                    'cpus': data['cpu'],
-                    'mem_gb': round(data['mem_gb'], 2),
-                    'total_gpus': data['total_gpus']
+                    "timestamp": timestamp,
+                    "user": user,
+                    "job_count": data["job_count"],
+                    "cpus": data["cpu"],
+                    "mem_gb": round(data["mem_gb"], 2),
+                    "total_gpus": data["total_gpus"],
                 }
-                for gpu_type in sorted_gpu_types:
-                    row[f'gpu_{gpu_type}'] = data['gpus'].get(gpu_type, 0)
+                # Populate each GPU column, defaulting to 0
+                for gpu_name in GPU_TYPES_ORDERED:
+                    row[f"gpu_{gpu_name}"] = data["gpus"].get(gpu_name, 0)
                 writer.writerow(row)
-        logging.info(f"Successfully wrote {len(current_usage)} user(s) data to {DATA_FILE}")
-    except IOError as e:
-        logging.error(f"Could not write to {DATA_FILE}: {e}")
-    except Exception as e:
-        logging.error(f"An unexpected error occurred during file writing: {e}")
+        logging.info("Wrote usage for %d user(s) to %s", len(usage), DATA_FILE)
+    except IOError as exc:
+        logging.error("Failed to write CSV: %s", exc)
+
 
 if __name__ == "__main__":
     main()

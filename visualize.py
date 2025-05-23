@@ -119,7 +119,7 @@ def generate_visualizations():
         cluster_gpu = df.groupby("timestamp")["total_gpus"].sum().reset_index()
         if not cluster_gpu.empty:
             plt.figure(figsize=(18, 7))
-            plt.plot(cluster_gpu["timestamp"], cluster_gpu["total_gpus"], marker="o", linestyle="-", label="Cluster Total")
+            plt.plot(cluster_gpu["timestamp"], cluster_gpu["total_gpus"], linestyle="-", label="Cluster Total")
             plt.title("Total GPU Usage Over Time (Cluster-wide)")
             plt.xlabel("Timestamp")
             plt.ylabel("Total GPUs Used")
@@ -147,7 +147,7 @@ def generate_visualizations():
         if not pivot.empty:
             plt.figure(figsize=(18, 10))
             for user in pivot.columns:
-                plt.plot(pivot.index, pivot[user], marker=".", linestyle="-", label=user, linewidth=4, markersize=12)
+                plt.plot(pivot.index, pivot[user], linestyle="-", label=user, linewidth=4, alpha=0.7)
             plt.title("GPU Usage Over Time (Top 10 Users)")
             plt.xlabel("Timestamp")
             plt.ylabel("Total GPUs Used")
@@ -200,7 +200,7 @@ def generate_visualizations():
         stacked_df = snap_sorted[snap_sorted["total_gpus"] > 0][["user"] + ordered_cols].set_index("user")
         if not stacked_df.empty:
             stacked_df = stacked_df[ordered_cols]
-            stacked_df.plot(kind="bar", stacked=True, figsize=(18, 10), colormap="winter")
+            stacked_df.plot(kind="bar", stacked=True, figsize=(18, 10), colormap="turbo")
             plt.title(f"GPU Usage by Type per User (Snapshot: {latest_ts:%Y-%m-%d %H:%M:%S})")
             plt.xlabel("User")
             plt.ylabel("GPUs Used")
